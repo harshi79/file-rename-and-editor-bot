@@ -20,29 +20,64 @@ Send it a `.txt`, `.py`, `.js`, `.json`, `.html`, … file and it will:
 - ✏️ Replace with any custom text (multi-line OK)
 - 📊 Result summary showing exactly what was edited and how many times
 - 🔤 Encoding-safe (UTF-8, with byte-preserving fallback) and CRLF-preserving
+- 💚 Built-in **`/health`** endpoint (returns `200 ok`) for UptimeRobot / Docker healthchecks
+- 🐳 **Dockerfile** included — no paid blueprints needed
 - 🚫 **No database, no API keys** — just the bot token
 
-## 🚀 Deploy on Render (free)
+## 🐳 Deploy with Docker (recommended)
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token
-2. Push this repo to GitHub, then in Render: **New → Web Service** → connect the repo
-   (or use the blueprint: **New → Blueprint** and pick this repo — `render.yaml` is included)
-3. Add the environment variable:
+```bash
+# 1. Build
+docker build -t file-editor-bot .
 
-   | Key | Value |
-   |---|---|
-   | `BOT_TOKEN` | `123456:ABC-your-token` |
+# 2. Run (map host port if you want external /health pings)
+docker run -d \
+  --name file-editor-bot \
+  -e BOT_TOKEN="123456:ABC-your-token" \
+  -e PORT=8080 \
+  -p 8080:8080 \
+  --restart unless-stopped \
+  file-editor-bot
+```
 
-4. Deploy — build `pip install -r requirements.txt`, start `python bot.py`. Done ✅
+### UptimeRobot / health probe
 
-The bot also runs a tiny health-check server on `$PORT` so it works as a Render **free web service**.
+Point any uptime monitor at:
 
-## 💻 Run locally
+| URL | Expected |
+|---|---|
+| `http://YOUR_HOST:8080/health` | **HTTP 200** · body `ok` |
+| `http://YOUR_HOST:8080/` | **HTTP 200** · body `ok` |
+
+Docker’s own `HEALTHCHECK` already hits `/health` every 30s.
+
+### docker-compose (optional)
+
+```yaml
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+```
+
+```bash
+export BOT_TOKEN="123456:ABC-your-token"
+docker compose up -d --build
+```
+
+## 💻 Run locally (no Docker)
 
 ```bash
 pip install -r requirements.txt
 export BOT_TOKEN="123456:ABC-your-token"
+export PORT=8080   # optional, default 8080
 python bot.py
+# then: curl http://127.0.0.1:8080/health  →  ok
 ```
 
 ## 🕹️ Usage
@@ -50,7 +85,7 @@ python bot.py
 ```
 /start          → how it works
 send a file     → list of detected links as buttons
-tap links       → select / deselect
+tap links       → select / deselect  (🟢 = on, ⚪ = off)
 [Mode]          → switch "link only" ✂️  ↔  "whole line" 🧹
 [🗑 Remove]     → delete selected
 [✏️ Replace]    → bot asks for replacement text (or /skip to remove)
@@ -72,8 +107,10 @@ Selected edits apply to **every occurrence** in the file.
 
 ```
 bot.py            # the whole bot (single file)
+Dockerfile        # production image + HEALTHCHECK on /health
+.dockerignore     # keep the image lean
 requirements.txt  # python-telegram-bot
-render.yaml       # Render blueprint
+render.yaml       # optional Render config (if you still use it)
 ```
 
 ## License
