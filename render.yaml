@@ -1,0 +1,13 @@
+# Render blueprint — deploys the bot as a free web service.
+# Set BOT_TOKEN in the Render dashboard (or below via sync:false prompt).
+services:
+  - type: web
+    name: file-rename-and-editor-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
