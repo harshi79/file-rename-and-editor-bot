@@ -1,5 +1,5 @@
-# Render blueprint — deploys the bot as a free web service.
-# Set BOT_TOKEN in the Render dashboard (or below via sync:false prompt).
+# Optional Render config (Dockerfile is the preferred free path).
+# Set BOT_TOKEN in the dashboard.
 services:
   - type: web
     name: file-rename-and-editor-bot
@@ -7,7 +7,7 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    healthCheckPath: /
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false

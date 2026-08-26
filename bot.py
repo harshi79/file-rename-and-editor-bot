@@ -14,7 +14,8 @@ Send the bot a text/code file (.txt, .py, .js, .json, ...) and it will:
 
 Config: only BOT_TOKEN (env var). No database needed.
 
-Deploy: Render web service (a tiny health-check HTTP server binds $PORT).
+Deploy: Docker (or any host). Tiny /health HTTP server binds $PORT for
+UptimeRobot / orchestrator probes.
 """
 
 import io
@@ -25,6 +26,7 @@ import threading
 import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
@@ -44,7 +46,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 MAX_FILE_MB = 18            # Bot API download limit is 20 MB; stay under it
 MAX_LINKS_SHOWN = 40        # inline keyboards cap at ~100 buttons
-MAX_LINK_LABEL = 56         # button text display length
+MAX_LINK_LABEL = 42         # button text display length
 SESSION_TTL = 15 * 60       # seconds before an idle session expires
 
 # Text / code extensions we accept (anything else is politely rejected)
@@ -235,41 +237,105 @@ def _short(link: str) -> str:
     return link if len(link) <= MAX_LINK_LABEL else link[: MAX_LINK_LABEL - 1] + "…"
 
 
+def _link_icon(link: str) -> str:
+    """Pick a small icon based on link type (display only)."""
+    low = link.lower()
+    if low.startswith("@"):
+        return "👤"
+    if "t.me/" in low or "telegram.me/" in low or "telegram.dog/" in low:
+        return "✈️"
+    if low.startswith("https://"):
+        return "🔗"
+    if low.startswith("http://"):
+        return "🌐"
+    return "🔗"
+
+
+def _div() -> str:
+    return "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+
+
 def build_keyboard(s: dict, awaiting: bool = False) -> InlineKeyboardMarkup:
-    rows = []
-    if not awaiting:
-        for i, link in enumerate(s["links"][:MAX_LINKS_SHOWN]):
-            mark = "✅" if i in s["selected"] else "⬜"
-            rows.append([InlineKeyboardButton(f"{mark} {_short(link)}",
-                                              callback_data=f"t{i}")])
-        mode_label = "whole line 🧹" if s["mode"] == "line" else "link only ✂️"
-        rows.append([InlineKeyboardButton(f"Mode: {mode_label}", callback_data="m")])
-        rows.append([
-            InlineKeyboardButton("🗑 Remove", callback_data="rm"),
-            InlineKeyboardButton("✏️ Replace", callback_data="rp"),
-        ])
-        rows.append([
-            InlineKeyboardButton("☑️ All", callback_data="sa"),
-            InlineKeyboardButton("⬜ None", callback_data="sn"),
-            InlineKeyboardButton("✖️ Cancel", callback_data="cx"),
-        ])
+    rows: list[list[InlineKeyboardButton]] = []
+    if awaiting:
+        return InlineKeyboardMarkup(rows)
+
+    selected = s["selected"]
+    links = s["links"][:MAX_LINKS_SHOWN]
+
+    # Link toggles — one per row so long URLs stay readable
+    for i, link in enumerate(links):
+        on = i in selected
+        mark = "🟢" if on else "⚪"
+        icon = _link_icon(link)
+        label = f"{mark} {icon} {_short(link)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"t{i}")])
+
+    n_sel = len(selected)
+    n_tot = len(links)
+
+    # Selection helpers
+    rows.append([
+        InlineKeyboardButton("☑️ Select all", callback_data="sa"),
+        InlineKeyboardButton("⬜ Clear", callback_data="sn"),
+    ])
+
+    # Mode toggle — shows the *current* mode clearly
+    if s["mode"] == "line":
+        mode_btn = InlineKeyboardButton(
+            "🧹 Mode · whole line  (tap → link only)",
+            callback_data="m",
+        )
+    else:
+        mode_btn = InlineKeyboardButton(
+            "✂️ Mode · link only  (tap → whole line)",
+            callback_data="m",
+        )
+    rows.append([mode_btn])
+
+    # Primary actions
+    rm_label = f"🗑 Remove ({n_sel})" if n_sel else "🗑 Remove"
+    rp_label = f"✏️ Replace ({n_sel})" if n_sel else "✏️ Replace"
+    rows.append([
+        InlineKeyboardButton(rm_label, callback_data="rm"),
+        InlineKeyboardButton(rp_label, callback_data="rp"),
+    ])
+
+    # Footer
+    rows.append([
+        InlineKeyboardButton(f"📎 {n_sel}/{n_tot} selected", callback_data="sa"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cx"),
+    ])
+
     return InlineKeyboardMarkup(rows)
 
 
 def build_header(s: dict) -> str:
     shown = s["links"][:MAX_LINKS_SHOWN]
     extra = len(s["links"]) - len(shown)
+    n_sel = len(s["selected"])
+    mode_name = "whole line 🧹" if s["mode"] == "line" else "link only ✂️"
+
     lines = [
-        f"📄 <b>{escape(s['file_name'])}</b>",
-        f"🔍 Found <b>{len(s['links'])}</b> unique link(s), {s['total']} occurrence(s).",
+        "╭─────────────────────╮",
+        "│  📄  <b>Link Editor</b>        │",
+        "╰─────────────────────╯",
         "",
-        "Tap a link to select it (tap again to untap — e.g. code decorators "
-        "like <code>@staticmethod</code> aren't Telegram handles), then choose "
-        "an action below.",
+        f"📁 <b>{escape(s['file_name'])}</b>",
+        f"🔍 <b>{len(s['links'])}</b> unique · <b>{s['total']}</b> total hits",
+        f"✅ Selected · <b>{n_sel}</b>",
+        f"⚙️ Mode · <b>{mode_name}</b>",
+        "",
+        _div(),
+        "<i>Tap a link to toggle · green = selected</i>",
+        "<i>Untap false positives (e.g. <code>@staticmethod</code>)</i>",
     ]
     if extra > 0:
-        lines.append(f"⚠️ Showing first {MAX_LINKS_SHOWN} of {len(s['links'])}.")
-    lines.append(f"⚙️ Mode: <b>{'whole line' if s['mode'] == 'line' else 'link only'}</b>")
+        lines.append("")
+        lines.append(
+            f"⚠️ Showing first <b>{MAX_LINKS_SHOWN}</b> of "
+            f"<b>{len(s['links'])}</b> links."
+        )
     return "\n".join(lines)
 
 
@@ -277,15 +343,31 @@ def build_summary(s: dict, stats: dict[str, int], action: str, replacement: str)
     verb = "replaced" if action == "replace" else "removed"
     unit = "line(s)" if s["mode"] == "line" else "link(s)"
     n = sum(stats.values())
-    out = [f"✅ <b>{escape(s['file_name'])}</b> — {n} {unit} {verb}."]
+    mode_name = "whole line" if s["mode"] == "line" else "link only"
+
+    out = [
+        "✨ <b>Done!</b>",
+        "",
+        f"📁 <b>{escape(s['file_name'])}</b>",
+        f"✅ <b>{n}</b> {unit} {verb}",
+        f"⚙️ Mode · <i>{mode_name}</i>",
+    ]
     if action == "replace":
-        out.append(f"✏️ Replacement: <code>{escape(_short(replacement))}</code>")
+        out.append(f"✏️ With · <code>{escape(_short(replacement))}</code>")
+
     out.append("")
+    out.append(_div())
+    out.append("<b>Changes</b>")
+
     for tok, cnt in list(stats.items())[:15]:
-        suffix = f" (×{cnt})" if cnt > 1 else ""
-        out.append(f"• <code>{escape(_short(tok))}</code>{suffix}")
+        icon = _link_icon(tok)
+        suffix = f"  ×{cnt}" if cnt > 1 else ""
+        out.append(f"{icon} <code>{escape(_short(tok))}</code>{suffix}")
     if len(stats) > 15:
-        out.append(f"• … and {len(stats) - 15} more")
+        out.append(f"… and <b>{len(stats) - 15}</b> more")
+
+    out.append("")
+    out.append("<i>Send another file anytime.</i>")
     return "\n".join(out)
 
 
@@ -294,15 +376,33 @@ def build_summary(s: dict, stats: dict[str, int], action: str, replacement: str)
 # --------------------------------------------------------------------------- #
 
 WELCOME = (
-    "👋 <b>File Promo-Link Editor</b>\n\n"
-    "Send me a <b>text or code file</b> (e.g. <code>.txt</code>, <code>.py</code>, "
-    "<code>.js</code>, <code>.json</code>) and I'll:\n\n"
-    "1️⃣ Find every link — <code>https://…</code>, <code>t.me/…</code>, <code>@username</code>\n"
-    "2️⃣ Show them as buttons — you tap the ones to edit\n"
-    "3️⃣ Remove them, or replace with your own promo text\n"
-    "4️⃣ Send the edited file back\n\n"
-    "❌ No zips, videos, photos or binaries — text/code files only.\n"
-    "📏 Max size ~18 MB."
+    "╭─────────────────────╮\n"
+    "│  👋  <b>File Link Editor</b>  │\n"
+    "╰─────────────────────╯\n"
+    "\n"
+    "Drop a <b>text / code file</b> and I’ll clean the promo junk out of it.\n"
+    "\n"
+    f"{_div()}\n"
+    "<b>What I catch</b>\n"
+    "🔗  <code>https://…</code>  ·  <code>http://…</code>\n"
+    "✈️  <code>t.me/…</code>  ·  telegram.me / .dog\n"
+    "👤  <code>@usernames</code>\n"
+    "\n"
+    f"{_div()}\n"
+    "<b>How it works</b>\n"
+    "1️⃣  Send a file as a <b>document</b> 📎\n"
+    "2️⃣  Tap the links you want to edit\n"
+    "3️⃣  <b>Remove</b> them — or <b>Replace</b> with your text\n"
+    "4️⃣  Get the edited file back, same name\n"
+    "\n"
+    f"{_div()}\n"
+    "✂️  <b>link only</b> — edit just the URL / handle\n"
+    "🧹  <b>whole line</b> — drop / swap the entire line\n"
+    "\n"
+    "❌  No zips, videos, photos or binaries\n"
+    f"📏  Max size ~{MAX_FILE_MB} MB\n"
+    "\n"
+    "<i>Commands · /help  ·  /cancel  ·  /skip</i>"
 )
 
 
@@ -315,7 +415,11 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     s = get_session(chat_id)
     if not s or s["awaiting"] != "replace" or s["user_id"] != update.effective_user.id:
-        await update.effective_message.reply_text("Nothing to skip 🙂")
+        await update.effective_message.reply_text(
+            "🤷 Nothing to skip right now.\n"
+            "<i>Send a file to get started.</i>",
+            parse_mode="HTML",
+        )
         return
     s["awaiting"] = None
     await _apply(update, context, s, "remove")
@@ -323,7 +427,11 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     SESSIONS.pop(update.effective_chat.id, None)
-    await update.effective_message.reply_text("✖️ Cancelled. Send a file any time.")
+    await update.effective_message.reply_text(
+        "❌ <b>Cancelled.</b>\n"
+        "<i>Send a file anytime to start over.</i>",
+        parse_mode="HTML",
+    )
 
 
 def _is_binary(data: bytes) -> bool:
@@ -337,17 +445,27 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if not is_text_file(doc.file_name or "", doc.mime_type):
         await msg.reply_text(
-            "❌ I only handle <b>text / code files</b> (like <code>.txt .py .js .json "
-            ".html .css .md</code>…).\nNo zips, videos, photos or binaries.",
+            "🚫 <b>Unsupported file</b>\n\n"
+            "I only handle <b>text / code</b> files:\n"
+            "<code>.txt  .py  .js  .json  .html  .css  .md</code> …\n\n"
+            "No zips, videos, photos or binaries.",
             parse_mode="HTML",
         )
         return
 
     if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
-        await msg.reply_text(f"❌ File too big — my limit is ~{MAX_FILE_MB} MB.")
+        await msg.reply_text(
+            f"📦 <b>File too big</b>\n\n"
+            f"Limit is ~<b>{MAX_FILE_MB} MB</b>. Try a smaller file.",
+            parse_mode="HTML",
+        )
         return
 
-    status = await msg.reply_text("⏳ Downloading and scanning…")
+    status = await msg.reply_text(
+        "⏳ <b>Downloading & scanning…</b>\n"
+        "<i>hang tight</i>",
+        parse_mode="HTML",
+    )
 
     buf = io.BytesIO()
     tg_file = await doc.get_file()
@@ -355,14 +473,23 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = buf.getvalue()
 
     if _is_binary(data):
-        await status.edit_text("❌ That looks like a binary file, not text/code.")
+        await status.edit_text(
+            "🚫 <b>Binary file detected</b>\n\n"
+            "That doesn’t look like text/code.",
+            parse_mode="HTML",
+        )
         return
 
     content, enc = decode_bytes(data)
     links, total = find_links(content)
 
     if not links:
-        await status.edit_text("🎉 No links found in this file — it's already clean!")
+        await status.edit_text(
+            "🎉 <b>All clean!</b>\n\n"
+            f"📁 <code>{escape(doc.file_name or 'file')}</code>\n"
+            "No promo links found in this file.",
+            parse_mode="HTML",
+        )
         SESSIONS.pop(chat_id, None)
         return
 
@@ -381,23 +508,34 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if s and s["awaiting"] == "replace" and s["user_id"] == update.effective_user.id:
         replacement = msg.text.strip()[:200]
         if not replacement:
-            await msg.reply_text("Replacement can't be empty. Send text, or /skip.")
+            await msg.reply_text(
+                "⚠️ Replacement can’t be empty.\n"
+                "Send some text, or /skip to remove instead.",
+                parse_mode="HTML",
+            )
             return
         s["awaiting"] = None
-        await msg.reply_text("⏳ Editing file…")
+        await msg.reply_text(
+            "⏳ <b>Editing file…</b>",
+            parse_mode="HTML",
+        )
         await _apply(update, context, s, "replace", replacement)
         return
 
     await msg.reply_text(
-        "Send me a <b>text/code file</b> as a <i>document</i> 📎 and I'll find its links.",
+        "📎 Send me a <b>text/code file</b> as a <i>document</i>\n"
+        "and I’ll find its links.\n\n"
+        "<i>Tip · use the paperclip → File, not photo.</i>",
         parse_mode="HTML",
     )
 
 
 async def on_media(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "❌ I only work with text/code files 📄 — not photos, videos, audio, "
-        "stickers or other media."
+        "🚫 <b>Media not supported</b>\n\n"
+        "I only work with text/code <b>files</b> 📄 —\n"
+        "not photos, videos, audio, stickers or other media.",
+        parse_mode="HTML",
     )
 
 
@@ -409,7 +547,11 @@ async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, s: dict,
 
     if not stats:
         await context.bot.send_message(
-            chat_id, "🤔 Nothing matched — tap at least one link first.")
+            chat_id,
+            "🤔 <b>Nothing matched</b>\n\n"
+            "Tap at least one link first, then try again.",
+            parse_mode="HTML",
+        )
         s["awaiting"] = None
         return
 
@@ -436,7 +578,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer("⌛ Session expired — send the file again.", show_alert=True)
         return
     if q.from_user.id != s["user_id"]:
-        await q.answer("🙂 This isn't your session — send your own file.")
+        await q.answer("🙂 This isn’t your session — send your own file.")
         return
 
     s["ts"] = _now()
@@ -450,45 +592,60 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         n = len(s["selected"])
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer(f"Selected {n}" if n else "Nothing selected")
+        await q.answer(f"✅ {n} selected" if n else "Selection cleared")
 
     elif data == "m":
         s["mode"] = "line" if s["mode"] == "link" else "link"
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer(f"Mode: {'whole line' if s['mode'] == 'line' else 'link only'}")
+        await q.answer(
+            f"Mode → {'whole line 🧹' if s['mode'] == 'line' else 'link only ✂️'}"
+        )
 
     elif data == "sa":
         s["selected"] = set(range(len(s["links"][:MAX_LINKS_SHOWN])))
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer("All selected")
+        await q.answer(f"✅ All {len(s['selected'])} selected")
 
     elif data == "sn":
         s["selected"] = set()
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer("Selection cleared")
+        await q.answer("⬜ Selection cleared")
 
     elif data == "rm":
         if not s["selected"]:
-            await q.answer("Tap at least one link first ⬆️")
+            await q.answer("Tap at least one link first ⬆️", show_alert=True)
             return
-        await q.answer()
-        await q.edit_message_text("⏳ Editing file…")
+        await q.answer("🗑 Removing…")
+        await q.edit_message_text(
+            "⏳ <b>Editing file…</b>\n"
+            f"<i>removing {len(s['selected'])} item(s)</i>",
+            parse_mode="HTML",
+        )
         await _apply(update, context, s, "remove")
 
     elif data == "rp":
         if not s["selected"]:
-            await q.answer("Tap at least one link first ⬆️")
+            await q.answer("Tap at least one link first ⬆️", show_alert=True)
             return
         s["awaiting"] = "replace"
         await q.answer()
+        n = len(s["selected"])
         await q.edit_message_text(
-            f"✏️ <b>{escape(s['file_name'])}</b>\n\n"
-            f"You selected <b>{len(s['selected'])}</b> link(s). "
-            "Now send me the <b>replacement text</b> "
-            "(or /skip to just remove them, /cancel to abort).",
+            "╭─────────────────────╮\n"
+            "│  ✏️  <b>Replace</b>              │\n"
+            "╰─────────────────────╯\n"
+            "\n"
+            f"📁 <b>{escape(s['file_name'])}</b>\n"
+            f"✅ <b>{n}</b> link(s) selected\n"
+            "\n"
+            f"{_div()}\n"
+            "Send the <b>replacement text</b> now.\n"
+            "\n"
+            "• /skip — remove instead\n"
+            "• /cancel — abort\n",
             parse_mode="HTML",
         )
 
@@ -496,9 +653,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         SESSIONS.pop(chat_id, None)
         await q.answer("Cancelled")
         try:
-            await q.delete_message()
+            await q.edit_message_text(
+                "❌ <b>Cancelled.</b>\n"
+                "<i>Send a file anytime to start over.</i>",
+                parse_mode="HTML",
+            )
         except Exception:
-            pass
+            try:
+                await q.delete_message()
+            except Exception:
+                pass
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -506,18 +670,44 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Health-check server (Render web services must bind $PORT)                    #
+# Health-check server (Docker / UptimeRobot / Render bind $PORT)               #
 # --------------------------------------------------------------------------- #
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        body = b"OK - file editor bot is running"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+    """Minimal HTTP server for uptime probes.
+
+    - GET /health  → 200  body "ok"   (preferred for UptimeRobot)
+    - GET /        → 200  body "ok"
+    - anything else → 404
+    """
+
+    def _reply(self, code: int, body: bytes, content_type: str = "text/plain; charset=utf-8") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path in ("/", "/health"):
+            self._reply(200, b"ok")
+        else:
+            self._reply(404, b"not found")
+
+    def do_HEAD(self) -> None:
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "2")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, *_args) -> None:  # silence request logs
         pass
@@ -527,7 +717,7 @@ def start_health_server() -> None:
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logging.info("Health server listening on 0.0.0.0:%s", port)
+    logging.info("Health server listening on 0.0.0.0:%s  →  GET /health", port)
 
 
 # --------------------------------------------------------------------------- #

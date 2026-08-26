@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+.venv
+venv
+.env
+*.md
+LICENSE
+render.yaml
+.DS_Store
