@@ -572,7 +572,7 @@ def _photo_arg(asset: str):
         return PHOTO_CACHE[asset]
     path = ASSET_DIR / asset
     if path.exists():
-        return InputFile(path)
+        return InputFile(str(path))
     return None
 
 
