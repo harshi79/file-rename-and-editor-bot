@@ -572,7 +572,11 @@ def _photo_arg(asset: str):
         return PHOTO_CACHE[asset]
     path = ASSET_DIR / asset
     if path.exists():
-        return InputFile(str(path))
+        try:
+            return InputFile(path.read_bytes(), filename=asset)
+        except Exception as exc:
+            logging.warning("Failed to load asset %s: %s", asset, exc)
+            return None
     return None
 
 
@@ -587,21 +591,46 @@ def _cache_photo(asset: str, msg) -> None:
 async def send_panel(bot, chat_id, panel: str, reply_to: int | None = None) -> None:
     asset, text, kb = PANELS[panel]
     photo = _photo_arg(asset)
-    if photo is None:  # artwork missing → text-only fallback
-        await bot.send_message(chat_id, text, parse_mode="HTML",
-                               reply_markup=kb, reply_to_message_id=reply_to)
-        return
-    m = await bot.send_photo(chat_id, photo, caption=text, parse_mode="HTML",
-                             reply_markup=kb, reply_to_message_id=reply_to)
-    _cache_photo(asset, m)
+    if photo is not None:
+        try:
+            m = await bot.send_photo(
+                chat_id,
+                photo,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=kb,
+                reply_to_message_id=reply_to,
+                allow_sending_without_reply=True,
+            )
+            _cache_photo(asset, m)
+            return
+        except Exception as exc:
+            logging.warning("send_photo failed for panel %s: %s; falling back to text", panel, exc)
+
+    # artwork missing or photo send failed → text-only fallback
+    await bot.send_message(
+        chat_id,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb,
+        reply_to_message_id=reply_to,
+        allow_sending_without_reply=True,
+    )
 
 
 async def edit_panel(q, panel: str) -> None:
     """Swap a menu message to another panel (photo → photo edit, with a
     send-new/delete-old fallback for non-photo messages)."""
     asset, text, kb = PANELS[panel]
+
+    # If the button was clicked on a document (e.g. from DONE_KB after a file edit/rename),
+    # send a new panel without deleting the user's deliverable file.
+    if q.message and getattr(q.message, "document", None):
+        await send_panel(q.get_bot(), q.message.chat.id, panel)
+        return
+
     photo = _photo_arg(asset)
-    if photo is not None:
+    if photo is not None and q.message and getattr(q.message, "photo", None):
         try:
             m = await q.edit_message_media(
                 InputMediaPhoto(photo, caption=text, parse_mode="HTML"),
@@ -611,6 +640,15 @@ async def edit_panel(q, panel: str) -> None:
             return
         except Exception:
             pass
+
+    # If the current message is text-only and photo is missing/disabled, edit in place
+    if photo is None and q.message and not getattr(q.message, "photo", None):
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            pass
+
     chat_id = q.message.chat.id if q.message else None
     if chat_id is not None:
         await send_panel(q.get_bot(), chat_id, panel)
@@ -770,11 +808,13 @@ DONE_KB = InlineKeyboardMarkup([
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_panel(context.bot, update.effective_chat.id, "start")
+    reply_to = update.effective_message.message_id if update.effective_message else None
+    await send_panel(context.bot, update.effective_chat.id, "start", reply_to=reply_to)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_panel(context.bot, update.effective_chat.id, "help")
+    reply_to = update.effective_message.message_id if update.effective_message else None
+    await send_panel(context.bot, update.effective_chat.id, "help", reply_to=reply_to)
 
 
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1043,6 +1083,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if target in PANELS:
             await q.answer()
             await edit_panel(q, target)
+            return
+        await q.answer()
         return
 
     # ---- link editor session callbacks ----
