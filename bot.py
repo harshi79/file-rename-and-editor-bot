@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
 """
-📄 Telegram File Promo-Link Editor Bot
-======================================
-Send the bot a text/code file (.txt, .py, .js, .json, ...) and it will:
+✦ Telegram File Studio — Link Editor + File Renamer
+===================================================
+Two tools in one bot:
 
-  1. Scan the content for every promo-ish thing:
-       - https://... and http://... links
-       - t.me / telegram.me / telegram.dog links (with or without scheme)
-       - @usernames (Telegram-style handles, 5-32 chars)
-  2. Show them as inline toggle buttons — tap to select which ones to edit
-  3. Remove or Replace the selected ones (link-only or whole-line mode)
-  4. Send the edited file back with the same name
+  A) LINK EDITOR (original logic, unchanged behaviour)
+     Send a text/code file (.txt, .py, .js, .json, ...) and it will:
+       1. Scan the content for every promo-ish thing:
+            - https://... and http://... links
+            - t.me / telegram.me / telegram.dog links (with or without scheme)
+            - @usernames (Telegram-style handles, 5-32 chars)
+       2. Show them as inline toggle buttons — tap to select which ones to edit
+       3. Remove or Replace the selected ones (link-only or whole-line mode)
+       4. Send the edited file back with the same name
 
-Config: only BOT_TOKEN (env var). No database needed.
+  B) FILE RENAMER (new, fully separate feature)
+     Reply to any file (document) with:
+       /rename newname           → keeps the original extension
+       /rename newname ext       → new name + new extension (dot optional)
+       /rename newname.txt       → name + extension in one token
+       /rename .ext              → extension only, name stays the same
+     The command also works inside the file's caption.
+
+Menu: /start opens a photo menu with inline buttons (editor / rename / help /
+about / commands / close) — every sub-menu has a back button. Panels use a
+small-caps unicode font and text symbols (no emojis). Each panel ships with
+its own anime artwork from ./assets (overridable via ASSET_BASE_URL).
+
+Config: BOT_TOKEN (env var). Optional: PORT, ASSET_BASE_URL. No database.
 
 Deploy: Docker (or any host). Tiny /health HTTP server binds $PORT for
 UptimeRobot / orchestrator probes.
@@ -26,9 +41,17 @@ import threading
 import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    InputMediaPhoto,
+    MessageEntity,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -48,6 +71,14 @@ MAX_FILE_MB = 18            # Bot API download limit is 20 MB; stay under it
 MAX_LINKS_SHOWN = 40        # inline keyboards cap at ~100 buttons
 MAX_LINK_LABEL = 42         # button text display length
 SESSION_TTL = 15 * 60       # seconds before an idle session expires
+CAPTION_MAX = 1024          # Telegram photo/document caption limit
+
+# Anime artwork for the menu panels. Local files are uploaded once and then
+# served from the cached Telegram file_id; set ASSET_BASE_URL to serve them
+# from a public host instead (e.g. a CDN or raw file hosting).
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+ASSET_BASE_URL = os.environ.get("ASSET_BASE_URL", "").strip().rstrip("/")
+PHOTO_CACHE: dict[str, str] = {}
 
 # Text / code extensions we accept (anything else is politely rejected)
 TEXT_EXTS = {
@@ -71,6 +102,57 @@ TEXT_MIMES = {
     "application/yaml", "application/x-yaml", "application/x-sh",
     "application/xhtml+xml",
 }
+
+# --------------------------------------------------------------------------- #
+# Small-caps unicode styling                                                   #
+# --------------------------------------------------------------------------- #
+
+_SC_MAP = {
+    "a": "ᴀ", "b": "ʙ", "c": "ᴄ", "d": "ᴅ", "e": "ᴇ", "f": "ꜰ", "g": "ɢ",
+    "h": "ʜ", "i": "ɪ", "j": "ᴊ", "k": "ᴋ", "l": "ʟ", "m": "ᴍ", "n": "ɴ",
+    "o": "ᴏ", "p": "ᴘ", "q": "ǫ", "r": "ʀ", "s": "ꜱ", "t": "ᴛ", "u": "ᴜ",
+    "v": "ᴠ", "w": "ᴡ", "x": "x", "y": "ʏ", "z": "ᴢ",
+}
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def sc_plain(text: str) -> str:
+    """Small-caps a plain (non-HTML) string (upper & lower case)."""
+    out = []
+    for c in text:
+        if "A" <= c <= "Z":
+            out.append(_SC_MAP[c.lower()])
+        else:
+            out.append(_SC_MAP.get(c, c))
+    return "".join(out)
+
+
+def esc_sc(text: str) -> str:
+    """Small-cap then HTML-escape a dynamic value (keeps entities valid)."""
+    return escape(sc_plain(text))
+
+
+def sc(html: str) -> str:
+    """Small-cap an HTML template; tags stay intact and <code>…</code>
+    content is left verbatim so links/commands stay readable."""
+    out: list[str] = []
+    pos = 0
+    in_code = False
+    for m in _TAG_RE.finditer(html):
+        seg = html[pos:m.start()]
+        out.append(seg if in_code else sc_plain(seg))
+        out.append(html[m.start():m.end()])
+        tag = m.group(0).lower()
+        if tag.startswith("<code"):
+            in_code = True
+        elif tag.startswith("</code"):
+            in_code = False
+        pos = m.end()
+    tail = html[pos:]
+    out.append(tail if in_code else sc_plain(tail))
+    return "".join(out)
+
 
 # --------------------------------------------------------------------------- #
 # Link detection                                                               #
@@ -189,7 +271,81 @@ def is_text_file(name: str, mime: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Sessions (in-memory, no DB)                                                  #
+# Rename parsing (fully separate from the editor)                              #
+# --------------------------------------------------------------------------- #
+
+_BAD_NAME_CHARS = re.compile(r"[\\/:*?\"<>|\x00-\x1f\x7f]")
+_EXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._-]{0,15}$")
+
+
+def _clean_stem(s: str) -> str:
+    s = _BAD_NAME_CHARS.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip().strip(".")
+    return s[:120]
+
+
+def _clean_ext(s: str) -> str:
+    s = s.strip().lstrip(".").strip()
+    s = re.sub(r"[^A-Za-z0-9+._-]", "", s).strip(".")
+    return s[:16]
+
+
+def parse_rename_target(raw: str, original: str) -> tuple[str | None, str]:
+    """Turn `/rename` args + the original filename into a new filename.
+
+    Accepted forms:
+      ``newname``            → keep the original extension
+      ``newname ext``        → new name + new extension (dot optional)
+      ``newname.ext``        → name + extension in a single token
+      ``.ext``               → extension only, original name kept
+
+    Returns ``(new_filename, "")`` or ``(None, error_message)``.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, "no name given"
+
+    stem, dot_ext = os.path.splitext(original or "file")
+    orig_ext = dot_ext.lstrip(".")
+
+    # form: ".ext" → extension only
+    if raw.startswith("."):
+        ext = _clean_ext(raw)
+        if not ext or not _EXT_RE.match(ext):
+            return None, f"“{raw}” isn’t a valid extension"
+        return f"{stem or 'file'}.{ext}", ""
+
+    parts = raw.split(None, 1)
+    first = parts[0]
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if rest:
+        # form: "newname ext"
+        new_stem = _clean_stem(first)
+        ext = _clean_ext(rest)
+    elif "." in first and not first.endswith("."):
+        # form: "newname.ext"
+        new_stem, e2 = os.path.splitext(first)
+        new_stem = _clean_stem(new_stem)
+        ext = _clean_ext(e2)
+    else:
+        # form: "newname"
+        new_stem = _clean_stem(first)
+        ext = orig_ext
+
+    if not new_stem:
+        return None, "the new name is empty after cleaning"
+    if ext and not _EXT_RE.match(ext):
+        return None, f"“{ext}” isn’t a valid extension"
+
+    new_name = f"{new_stem}.{ext}" if ext else new_stem
+    if len(new_name) > 200:
+        return None, "that name is too long (max 200 chars)"
+    return new_name, ""
+
+
+# --------------------------------------------------------------------------- #
+# Sessions (in-memory, no DB) — link editor only                               #
 # --------------------------------------------------------------------------- #
 
 # chat_id -> session
@@ -229,7 +385,7 @@ def new_session(chat_id: int, user_id: int, name: str, content: str, enc: str,
 
 
 # --------------------------------------------------------------------------- #
-# UI helpers                                                                   #
+# UI helpers — text symbols only (no emojis), small-caps font                  #
 # --------------------------------------------------------------------------- #
 
 
@@ -238,21 +394,254 @@ def _short(link: str) -> str:
 
 
 def _link_icon(link: str) -> str:
-    """Pick a small icon based on link type (display only)."""
+    """Small text glyph per link type (display only)."""
     low = link.lower()
     if low.startswith("@"):
-        return "👤"
+        return "✦"
     if "t.me/" in low or "telegram.me/" in low or "telegram.dog/" in low:
-        return "✈️"
+        return "➜"
     if low.startswith("https://"):
-        return "🔗"
+        return "❖"
     if low.startswith("http://"):
-        return "🌐"
-    return "🔗"
+        return "◇"
+    return "◆"
 
 
 def _div() -> str:
-    return "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+    return "┄┄┄┄┄┄┄┄┄┄┄"
+
+
+def _box(title: str) -> str:
+    inner_w = 27
+    t = f"  {title}  "
+    if len(t) > inner_w:
+        t = t[:inner_w]
+    t += " " * (inner_w - len(t))
+    bar = "─" * inner_w
+    return f"╭{bar}╮\n│{t}│\n╰{bar}╯"
+
+
+# --------------------------------------------------------------------------- #
+# Photo panels (start / help / editor / rename / commands / about)             #
+# --------------------------------------------------------------------------- #
+
+
+def _nav_btn(label: str, target: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(sc_plain(label), callback_data=f"n:{target}")
+
+
+def _kb_home_back(extra: list[list[InlineKeyboardButton]] | None = None):
+    rows = list(extra or [])
+    rows.append([_nav_btn("≡ ᴄᴏᴍᴍᴀɴᴅꜱ", "commands"), _nav_btn("◂ ʙᴀᴄᴋ", "start")])
+    return InlineKeyboardMarkup(rows)
+
+
+START_TEXT = sc(
+    _box("⌂ file studio") + "\n"
+    "\n"
+    "hello ◡̈  i clean & rename your files.\n"
+    "\n"
+    "◆ <b>link editor</b> ▸ strip promo links from text & code files\n"
+    "◆ <b>file renamer</b> ▸ rename any file by replying to it\n"
+    "\n" + _div() + "\n"
+    "◂ tap a menu below ◂"
+)
+
+START_KB = InlineKeyboardMarkup([
+    [_nav_btn("✎ link editor", "editor"), _nav_btn("✦ renamer", "rename")],
+    [_nav_btn("❖ help", "help"), _nav_btn("♥ about", "about")],
+    [_nav_btn("≡ commands", "commands"), _nav_btn("✕ close", "close")],
+])
+
+HELP_TEXT = sc(
+    _box("❖ help & guide") + "\n"
+    "\n"
+    "<b>link editor</b>\n"
+    "1. send a text/code file as a document ▤\n"
+    "2. tap links to select · ◉ = on · ○ = off\n"
+    "3. <b>remove</b> them — or <b>replace</b> with your text\n"
+    "4. get the edited file back, same name\n"
+    "\n"
+    "<b>file renamer</b>\n"
+    "reply to any file with <code>/rename</code> + args —\n"
+    "see the rename menu for examples.\n"
+    "\n"
+    "<b>what i catch</b>\n"
+    "➜ <code>https://…</code> · <code>http://…</code>\n"
+    "➜ <code>t.me/…</code> · telegram.me · telegram.dog\n"
+    "➜ <code>@usernames</code>\n"
+    "\n"
+    "<b>modes</b>\n"
+    "⌁ link only ▸ edit just the url / handle\n"
+    "⌁ whole line ▸ drop / swap the full line\n"
+    "\n" + _div() + "\n"
+    f"△ no zips / videos / binaries · max ~{MAX_FILE_MB} mb"
+)
+
+HELP_KB = _kb_home_back([
+    [_nav_btn("✎ editor guide", "editor"), _nav_btn("✦ rename guide", "rename")],
+])
+
+EDITOR_TEXT = sc(
+    _box("✎ link editor") + "\n"
+    "\n"
+    "send a <b>text / code file</b> as a document ▤\n"
+    "i list every link as a button — tap to toggle.\n"
+    "\n"
+    "◆ ◉ / ○ ▸ selected / not selected\n"
+    "◆ ✕ remove ▸ delete the selected links\n"
+    "◆ ✎ replace ▸ swap them for your own text\n"
+    "  · /skip ▸ remove instead of replacing\n"
+    "\n"
+    "<b>modes</b>\n"
+    "⌁ link only  touch only the url / handle\n"
+    "⌁ whole line ▸ drop or swap the entire line\n"
+    "\n" + _div() + "\n"
+    "△ untap false positives like <code>@staticmethod</code>\n"
+    "△ supported: text & code files only · max ~18 mb"
+)
+
+EDITOR_KB = _kb_home_back()
+
+RENAME_TEXT = sc(
+    _box("✦ file renamer") + "\n"
+    "\n"
+    "reply to any file (document) with:\n"
+    "\n"
+    "<code>/rename newname</code>\n"
+    "▸ keeps the original extension\n"
+    "\n"
+    "<code>/rename newname ext</code>\n"
+    "▸ new name + new extension (dot optional)\n"
+    "\n"
+    "<code>/rename newname.txt</code>\n"
+    "▸ name + extension in one token\n"
+    "\n"
+    "<code>/rename .md</code>\n"
+    "▸ extension only — name stays same\n"
+    "\n" + _div() + "\n"
+    "◆ you can also put the command in the file's caption\n"
+    "◆ file size limit ~18 mb"
+)
+
+RENAME_KB = _kb_home_back()
+
+COMMANDS_TEXT = sc(
+    _box("≡ commands") + "\n"
+    "\n"
+    "<code>/start</code> ▸ open the main menu\n"
+    "<code>/help</code> ▸ help & guide\n"
+    "<code>/rename</code> ▸ rename the file you reply to\n"
+    "<code>/skip</code> ▸ remove instead of replace\n"
+    "<code>/cancel</code> ▸ abort the current edit\n"
+    "\n" + _div() + "\n"
+    "◆ you can also just send a file — no command needed"
+)
+
+COMMANDS_KB = _kb_home_back([[_nav_btn("❖ help", "help")]])
+
+ABOUT_TEXT = sc(
+    _box("♥ about") + "\n"
+    "\n"
+    "<b>file studio</b> · link editor + file renamer\n"
+    "\n"
+    "◆ no database — files are edited in memory\n"
+    "◆ encoding-safe · crlf-preserving\n"
+    "◆ open source · mit license\n"
+    "\n" + _div() + "\n"
+    "made with ♥ for clean files"
+)
+
+ABOUT_KB = _kb_home_back()
+
+PANELS: dict[str, tuple[str, str, InlineKeyboardMarkup]] = {
+    "start": ("start.jpg", START_TEXT, START_KB),
+    "help": ("help.jpg", HELP_TEXT, HELP_KB),
+    "editor": ("editor.jpg", EDITOR_TEXT, EDITOR_KB),
+    "rename": ("rename.jpg", RENAME_TEXT, RENAME_KB),
+    "commands": ("commands.jpg", COMMANDS_TEXT, COMMANDS_KB),
+    "about": ("about.jpg", ABOUT_TEXT, ABOUT_KB),
+}
+
+
+def _photo_arg(asset: str):
+    """URL / cached file_id / fresh upload for an asset image."""
+    if ASSET_BASE_URL:
+        return f"{ASSET_BASE_URL}/{asset}"
+    if asset in PHOTO_CACHE:
+        return PHOTO_CACHE[asset]
+    path = ASSET_DIR / asset
+    if path.exists():
+        return InputFile(path)
+    return None
+
+
+def _cache_photo(asset: str, msg) -> None:
+    try:
+        if msg is not None and getattr(msg, "photo", None):
+            PHOTO_CACHE[asset] = msg.photo[-1].file_id
+    except Exception:
+        pass
+
+
+async def send_panel(bot, chat_id, panel: str, reply_to: int | None = None) -> None:
+    asset, text, kb = PANELS[panel]
+    photo = _photo_arg(asset)
+    if photo is None:  # artwork missing → text-only fallback
+        await bot.send_message(chat_id, text, parse_mode="HTML",
+                               reply_markup=kb, reply_to_message_id=reply_to)
+        return
+    m = await bot.send_photo(chat_id, photo, caption=text, parse_mode="HTML",
+                             reply_markup=kb, reply_to_message_id=reply_to)
+    _cache_photo(asset, m)
+
+
+async def edit_panel(q, panel: str) -> None:
+    """Swap a menu message to another panel (photo → photo edit, with a
+    send-new/delete-old fallback for non-photo messages)."""
+    asset, text, kb = PANELS[panel]
+    photo = _photo_arg(asset)
+    if photo is not None:
+        try:
+            m = await q.edit_message_media(
+                InputMediaPhoto(photo, caption=text, parse_mode="HTML"),
+                reply_markup=kb,
+            )
+            _cache_photo(asset, m)
+            return
+        except Exception:
+            pass
+    chat_id = q.message.chat.id if q.message else None
+    if chat_id is not None:
+        await send_panel(q.get_bot(), chat_id, panel)
+    try:
+        await q.delete_message()
+    except Exception:
+        pass
+
+
+def _split_caption(text: str, limit: int = CAPTION_MAX) -> list[str]:
+    """Split long text into caption-sized chunks at paragraph boundaries."""
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for para in text.split("\n\n"):
+        piece = (cur + "\n\n" + para) if cur else para
+        if len(piece) > limit and cur:
+            chunks.append(cur)
+            piece = para
+        while len(piece) > limit:  # pathological single paragraph
+            chunks.append(piece[:limit])
+            piece = piece[limit:]
+        cur = piece
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+# --------------------------------------------------------------------------- #
+# Link-editor UI (same logic as before, restyled)                              #
+# --------------------------------------------------------------------------- #
 
 
 def build_keyboard(s: dict, awaiting: bool = False) -> InlineKeyboardMarkup:
@@ -263,10 +652,11 @@ def build_keyboard(s: dict, awaiting: bool = False) -> InlineKeyboardMarkup:
     selected = s["selected"]
     links = s["links"][:MAX_LINKS_SHOWN]
 
-    # Link toggles — one per row so long URLs stay readable
+    # Link toggles — one per row so long URLs stay readable.
+    # Link text itself is NOT small-capped so URLs stay copy-able.
     for i, link in enumerate(links):
         on = i in selected
-        mark = "🟢" if on else "⚪"
+        mark = "◉" if on else "○"
         icon = _link_icon(link)
         label = f"{mark} {icon} {_short(link)}"
         rows.append([InlineKeyboardButton(label, callback_data=f"t{i}")])
@@ -276,35 +666,35 @@ def build_keyboard(s: dict, awaiting: bool = False) -> InlineKeyboardMarkup:
 
     # Selection helpers
     rows.append([
-        InlineKeyboardButton("☑️ Select all", callback_data="sa"),
-        InlineKeyboardButton("⬜ Clear", callback_data="sn"),
+        InlineKeyboardButton(sc_plain("◈ select all"), callback_data="sa"),
+        InlineKeyboardButton(sc_plain("◇ clear"), callback_data="sn"),
     ])
 
     # Mode toggle — shows the *current* mode clearly
     if s["mode"] == "line":
         mode_btn = InlineKeyboardButton(
-            "🧹 Mode · whole line  (tap → link only)",
+            sc_plain("⌁ mode · whole line  (tap → link only)"),
             callback_data="m",
         )
     else:
         mode_btn = InlineKeyboardButton(
-            "✂️ Mode · link only  (tap → whole line)",
+            sc_plain("⌁ mode · link only  (tap → whole line)"),
             callback_data="m",
         )
     rows.append([mode_btn])
 
     # Primary actions
-    rm_label = f"🗑 Remove ({n_sel})" if n_sel else "🗑 Remove"
-    rp_label = f"✏️ Replace ({n_sel})" if n_sel else "✏️ Replace"
+    rm_label = f"✕ remove ({n_sel})" if n_sel else "✕ remove"
+    rp_label = f"✎ replace ({n_sel})" if n_sel else "✎ replace"
     rows.append([
-        InlineKeyboardButton(rm_label, callback_data="rm"),
-        InlineKeyboardButton(rp_label, callback_data="rp"),
+        InlineKeyboardButton(sc_plain(rm_label), callback_data="rm"),
+        InlineKeyboardButton(sc_plain(rp_label), callback_data="rp"),
     ])
 
     # Footer
     rows.append([
-        InlineKeyboardButton(f"📎 {n_sel}/{n_tot} selected", callback_data="sa"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cx"),
+        InlineKeyboardButton(sc_plain(f"◉ {n_sel}/{n_tot} selected"), callback_data="sa"),
+        InlineKeyboardButton(sc_plain("✕ cancel"), callback_data="cx"),
     ])
 
     return InlineKeyboardMarkup(rows)
@@ -314,29 +704,27 @@ def build_header(s: dict) -> str:
     shown = s["links"][:MAX_LINKS_SHOWN]
     extra = len(s["links"]) - len(shown)
     n_sel = len(s["selected"])
-    mode_name = "whole line 🧹" if s["mode"] == "line" else "link only ✂️"
+    mode_name = "whole line ⌁" if s["mode"] == "line" else "link only ⌁"
 
     lines = [
-        "╭─────────────────────╮",
-        "│  📄  <b>Link Editor</b>        │",
-        "╰─────────────────────╯",
+        _box("✎ link editor"),
         "",
-        f"📁 <b>{escape(s['file_name'])}</b>",
-        f"🔍 <b>{len(s['links'])}</b> unique · <b>{s['total']}</b> total hits",
-        f"✅ Selected · <b>{n_sel}</b>",
-        f"⚙️ Mode · <b>{mode_name}</b>",
+        f"▤ <b>{esc_sc(s['file_name'])}</b>",
+        f"◎ <b>{len(s['links'])}</b> unique · <b>{s['total']}</b> total hits",
+        f"◉ selected · <b>{n_sel}</b>",
+        f"❖ mode · <b>{mode_name}</b>",
         "",
         _div(),
-        "<i>Tap a link to toggle · green = selected</i>",
-        "<i>Untap false positives (e.g. <code>@staticmethod</code>)</i>",
+        "<i>tap a link to toggle · ◉ = selected</i>",
+        "<i>untap false positives (e.g. <code>@staticmethod</code>)</i>",
     ]
     if extra > 0:
         lines.append("")
         lines.append(
-            f"⚠️ Showing first <b>{MAX_LINKS_SHOWN}</b> of "
+            f"△ showing first <b>{MAX_LINKS_SHOWN}</b> of "
             f"<b>{len(s['links'])}</b> links."
         )
-    return "\n".join(lines)
+    return sc("\n".join(lines))
 
 
 def build_summary(s: dict, stats: dict[str, int], action: str, replacement: str) -> str:
@@ -346,18 +734,18 @@ def build_summary(s: dict, stats: dict[str, int], action: str, replacement: str)
     mode_name = "whole line" if s["mode"] == "line" else "link only"
 
     out = [
-        "✨ <b>Done!</b>",
+        "✓ <b>done!</b>",
         "",
-        f"📁 <b>{escape(s['file_name'])}</b>",
-        f"✅ <b>{n}</b> {unit} {verb}",
-        f"⚙️ Mode · <i>{mode_name}</i>",
+        f"▤ <b>{esc_sc(s['file_name'])}</b>",
+        f"✓ <b>{n}</b> {unit} {verb}",
+        f"❖ mode · <i>{mode_name}</i>",
     ]
     if action == "replace":
-        out.append(f"✏️ With · <code>{escape(_short(replacement))}</code>")
+        out.append(f"✎ with · <code>{escape(_short(replacement))}</code>")
 
     out.append("")
     out.append(_div())
-    out.append("<b>Changes</b>")
+    out.append("<b>changes</b>")
 
     for tok, cnt in list(stats.items())[:15]:
         icon = _link_icon(tok)
@@ -367,47 +755,39 @@ def build_summary(s: dict, stats: dict[str, int], action: str, replacement: str)
         out.append(f"… and <b>{len(stats) - 15}</b> more")
 
     out.append("")
-    out.append("<i>Send another file anytime.</i>")
-    return "\n".join(out)
+    out.append("<i>send another file anytime.</i>")
+    return sc("\n".join(out))
+
+
+DONE_KB = InlineKeyboardMarkup([
+    [_nav_btn("⌂ home", "start"), _nav_btn("❖ help", "help")],
+])
 
 
 # --------------------------------------------------------------------------- #
 # Handlers                                                                     #
 # --------------------------------------------------------------------------- #
 
-WELCOME = (
-    "╭─────────────────────╮\n"
-    "│  👋  <b>File Link Editor</b>  │\n"
-    "╰─────────────────────╯\n"
-    "\n"
-    "Drop a <b>text / code file</b> and I’ll clean the promo junk out of it.\n"
-    "\n"
-    f"{_div()}\n"
-    "<b>What I catch</b>\n"
-    "🔗  <code>https://…</code>  ·  <code>http://…</code>\n"
-    "✈️  <code>t.me/…</code>  ·  telegram.me / .dog\n"
-    "👤  <code>@usernames</code>\n"
-    "\n"
-    f"{_div()}\n"
-    "<b>How it works</b>\n"
-    "1️⃣  Send a file as a <b>document</b> 📎\n"
-    "2️⃣  Tap the links you want to edit\n"
-    "3️⃣  <b>Remove</b> them — or <b>Replace</b> with your text\n"
-    "4️⃣  Get the edited file back, same name\n"
-    "\n"
-    f"{_div()}\n"
-    "✂️  <b>link only</b> — edit just the URL / handle\n"
-    "🧹  <b>whole line</b> — drop / swap the entire line\n"
-    "\n"
-    "❌  No zips, videos, photos or binaries\n"
-    f"📏  Max size ~{MAX_FILE_MB} MB\n"
-    "\n"
-    "<i>Commands · /help  ·  /cancel  ·  /skip</i>"
-)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_panel(context.bot, update.effective_chat.id, "start")
 
 
-async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(WELCOME, parse_mode="HTML")
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_panel(context.bot, update.effective_chat.id, "help")
+
+
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rename [args] — as a reply to a document (or with one attached)."""
+    msg = update.effective_message
+    doc = None
+    if msg.reply_to_message is not None and msg.reply_to_message.document:
+        doc = msg.reply_to_message.document
+    elif msg.document:
+        doc = msg.document
+
+    raw = " ".join(context.args or "").strip()
+    await do_rename(update, context, doc, raw)
 
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -416,8 +796,8 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_session(chat_id)
     if not s or s["awaiting"] != "replace" or s["user_id"] != update.effective_user.id:
         await update.effective_message.reply_text(
-            "🤷 Nothing to skip right now.\n"
-            "<i>Send a file to get started.</i>",
+            sc("△ nothing to skip right now.\n") +
+            "<i>send a file to get started.</i>",
             parse_mode="HTML",
         )
         return
@@ -428,8 +808,7 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     SESSIONS.pop(update.effective_chat.id, None)
     await update.effective_message.reply_text(
-        "❌ <b>Cancelled.</b>\n"
-        "<i>Send a file anytime to start over.</i>",
+        sc("✕ cancelled.\n") + "<i>send a file anytime to start over.</i>",
         parse_mode="HTML",
     )
 
@@ -438,32 +817,104 @@ def _is_binary(data: bytes) -> bool:
     return b"\x00" in data[:8192]
 
 
+def _caption_command(msg) -> tuple[str, list[str]] | None:
+    """Detect a bot command typed as a document caption (CommandHandler only
+    sees message text, so captions are routed manually)."""
+    ents = msg.caption_entities or ()
+    if not (ents and ents[0].type == MessageEntity.BOT_COMMAND
+            and ents[0].offset == 0 and msg.caption):
+        return None
+    cmd = msg.caption[1:ents[0].length].split("@")[0].lower()
+    args = msg.caption[ents[0].length:].strip().split()
+    return cmd, args
+
+
+async def do_rename(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    doc, raw_args: str) -> None:
+    """The standalone rename flow — never touches editor sessions."""
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+
+    if doc is None or not raw_args:
+        # no file or no args → show the rename guide
+        await send_panel(context.bot, chat_id, "rename", reply_to=msg.message_id)
+        return
+
+    if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
+        await msg.reply_text(
+            sc(f"△ file too big — limit is ~{MAX_FILE_MB} mb."),
+            parse_mode="HTML",
+        )
+        return
+
+    old_name = doc.file_name or "file"
+    new_name, err = parse_rename_target(raw_args, old_name)
+    if err:
+        await msg.reply_text(
+            sc("△ that name won't work — ") + esc_sc(err) + "\n\n"
+            "<i>e.g. <code>/rename notes</code> · "
+            "<code>/rename notes md</code> · <code>/rename .md</code></i>",
+            parse_mode="HTML",
+        )
+        return
+
+    status = await msg.reply_text(sc("◌ renaming…"), parse_mode="HTML")
+
+    buf = io.BytesIO()
+    tg_file = await doc.get_file()
+    await tg_file.download_to_memory(buf)
+    buf.seek(0)
+
+    summary = sc(
+        "✓ <b>renamed!</b>\n\n"
+        f"▤ old · <code>{escape(_short(old_name))}</code>\n"
+        f"▸ new · <code>{escape(_short(new_name))}</code>\n\n"
+        "<i>reply to any file with /rename to use again.</i>"
+    )
+    await context.bot.send_document(
+        chat_id,
+        document=InputFile(buf, filename=new_name),
+        caption=summary[:CAPTION_MAX],
+        parse_mode="HTML",
+        reply_markup=DONE_KB,
+    )
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     doc = msg.document
     chat_id = update.effective_chat.id
 
+    # "/rename …" typed as the file's caption → standalone rename flow
+    cap = _caption_command(msg)
+    if cap and cap[0] == "rename":
+        await do_rename(update, context, doc, " ".join(cap[1]))
+        return
+
     if not is_text_file(doc.file_name or "", doc.mime_type):
         await msg.reply_text(
-            "🚫 <b>Unsupported file</b>\n\n"
-            "I only handle <b>text / code</b> files:\n"
-            "<code>.txt  .py  .js  .json  .html  .css  .md</code> …\n\n"
-            "No zips, videos, photos or binaries.",
+            sc("△ unsupported file\n\n"
+               "i only handle text / code files:\n"
+               ".txt  .py  .js  .json  .html  .css  .md …\n\n"
+               "no zips, videos, photos or binaries.\n"
+               "(tip: reply to any file with /rename to rename it)"),
             parse_mode="HTML",
         )
         return
 
     if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
         await msg.reply_text(
-            f"📦 <b>File too big</b>\n\n"
-            f"Limit is ~<b>{MAX_FILE_MB} MB</b>. Try a smaller file.",
+            sc(f"△ file too big\n\nlimit is ~{MAX_FILE_MB} mb. try a smaller file."),
             parse_mode="HTML",
         )
         return
 
     status = await msg.reply_text(
-        "⏳ <b>Downloading & scanning…</b>\n"
-        "<i>hang tight</i>",
+        sc("◌ downloading & scanning…\n") + "<i>hang tight</i>",
         parse_mode="HTML",
     )
 
@@ -474,8 +925,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if _is_binary(data):
         await status.edit_text(
-            "🚫 <b>Binary file detected</b>\n\n"
-            "That doesn’t look like text/code.",
+            sc("△ binary file detected\n\nthat doesn't look like text/code."),
             parse_mode="HTML",
         )
         return
@@ -484,13 +934,21 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     links, total = find_links(content)
 
     if not links:
-        await status.edit_text(
-            "🎉 <b>All clean!</b>\n\n"
-            f"📁 <code>{escape(doc.file_name or 'file')}</code>\n"
-            "No promo links found in this file.",
-            parse_mode="HTML",
-        )
         SESSIONS.pop(chat_id, None)
+        text = sc("✓ <b>all clean!</b>\n\n"
+                  f"▤ <code>{escape(doc.file_name or 'file')}</code>\n"
+                  "no promo links found in this file.")
+        asset = _photo_arg("done.jpg")
+        try:
+            if asset is None:
+                raise RuntimeError("no artwork")
+            m = await status.edit_media(
+                InputMediaPhoto(asset, caption=text, parse_mode="HTML"),
+                reply_markup=DONE_KB,
+            )
+            _cache_photo("done.jpg", m)
+        except Exception:
+            await status.edit_text(text, parse_mode="HTML", reply_markup=DONE_KB)
         return
 
     s = new_session(chat_id, update.effective_user.id, doc.file_name or "file.txt",
@@ -509,32 +967,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         replacement = msg.text.strip()[:200]
         if not replacement:
             await msg.reply_text(
-                "⚠️ Replacement can’t be empty.\n"
-                "Send some text, or /skip to remove instead.",
+                sc("△ replacement can't be empty.\n"
+                   "send some text, or /skip to remove instead."),
                 parse_mode="HTML",
             )
             return
         s["awaiting"] = None
-        await msg.reply_text(
-            "⏳ <b>Editing file…</b>",
-            parse_mode="HTML",
-        )
+        await msg.reply_text(sc("◌ editing file…"), parse_mode="HTML")
         await _apply(update, context, s, "replace", replacement)
         return
 
     await msg.reply_text(
-        "📎 Send me a <b>text/code file</b> as a <i>document</i>\n"
-        "and I’ll find its links.\n\n"
-        "<i>Tip · use the paperclip → File, not photo.</i>",
+        sc("▤ send me a text/code file as a document\n"
+           "and i'll find its links.\n\n"
+           "tip · use the paperclip → file, not photo.\n"
+           "rename · reply to a file with /rename newname"),
         parse_mode="HTML",
     )
 
 
 async def on_media(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "🚫 <b>Media not supported</b>\n\n"
-        "I only work with text/code <b>files</b> 📄 —\n"
-        "not photos, videos, audio, stickers or other media.",
+        sc("△ media not supported\n\n"
+           "i only work with text/code files ▤ —\n"
+           "not photos, videos, audio, stickers or other media."),
         parse_mode="HTML",
     )
 
@@ -548,8 +1004,8 @@ async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, s: dict,
     if not stats:
         await context.bot.send_message(
             chat_id,
-            "🤔 <b>Nothing matched</b>\n\n"
-            "Tap at least one link first, then try again.",
+            sc("△ nothing matched\n\n"
+               "tap at least one link first, then try again."),
             parse_mode="HTML",
         )
         s["awaiting"] = None
@@ -564,6 +1020,7 @@ async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, s: dict,
         document=InputFile(io.BytesIO(data), filename=s["file_name"]),
         caption=caption,
         parse_mode="HTML",
+        reply_markup=DONE_KB,
     )
     SESSIONS.pop(chat_id, None)
 
@@ -572,13 +1029,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     q = update.callback_query
     chat_id = update.effective_chat.id
     data = q.data or ""
+
+    # ---- menu navigation (works with or without an editor session) ----
+    if data.startswith("n:"):
+        target = data[2:]
+        if target == "close":
+            await q.answer()
+            try:
+                await q.delete_message()
+            except Exception:
+                pass
+            return
+        if target in PANELS:
+            await q.answer()
+            await edit_panel(q, target)
+        return
+
+    # ---- link editor session callbacks ----
     s = get_session(chat_id)
 
     if not s:
-        await q.answer("⌛ Session expired — send the file again.", show_alert=True)
+        await q.answer(sc_plain("△ session expired — send the file again."),
+                       show_alert=True)
         return
     if q.from_user.id != s["user_id"]:
-        await q.answer("🙂 This isn’t your session — send your own file.")
+        await q.answer(sc_plain("◌ this isn't your session — send your own file."))
         return
 
     s["ts"] = _now()
@@ -592,35 +1067,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         n = len(s["selected"])
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer(f"✅ {n} selected" if n else "Selection cleared")
+        await q.answer(sc_plain(f"✓ {n} selected") if n else "Selection cleared")
 
     elif data == "m":
         s["mode"] = "line" if s["mode"] == "link" else "link"
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
         await q.answer(
-            f"Mode → {'whole line 🧹' if s['mode'] == 'line' else 'link only ✂️'}"
+            f"Mode → {'whole line ⌁' if s['mode'] == 'line' else 'link only ⌁'}"
         )
 
     elif data == "sa":
         s["selected"] = set(range(len(s["links"][:MAX_LINKS_SHOWN])))
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer(f"✅ All {len(s['selected'])} selected")
+        await q.answer(sc_plain(f"✓ all {len(s['selected'])} selected"))
 
     elif data == "sn":
         s["selected"] = set()
         await q.edit_message_text(build_header(s), parse_mode="HTML",
                                   reply_markup=build_keyboard(s))
-        await q.answer("⬜ Selection cleared")
+        await q.answer(sc_plain("◇ selection cleared"))
 
     elif data == "rm":
         if not s["selected"]:
-            await q.answer("Tap at least one link first ⬆️", show_alert=True)
+            await q.answer("Tap at least one link first ▲", show_alert=True)
             return
-        await q.answer("🗑 Removing…")
+        await q.answer("✕ Removing…")
         await q.edit_message_text(
-            "⏳ <b>Editing file…</b>\n"
+            sc("◌ editing file…\n") +
             f"<i>removing {len(s['selected'])} item(s)</i>",
             parse_mode="HTML",
         )
@@ -628,24 +1103,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     elif data == "rp":
         if not s["selected"]:
-            await q.answer("Tap at least one link first ⬆️", show_alert=True)
+            await q.answer("Tap at least one link first ▲", show_alert=True)
             return
         s["awaiting"] = "replace"
         await q.answer()
         n = len(s["selected"])
         await q.edit_message_text(
-            "╭─────────────────────╮\n"
-            "│  ✏️  <b>Replace</b>              │\n"
-            "╰─────────────────────╯\n"
-            "\n"
-            f"📁 <b>{escape(s['file_name'])}</b>\n"
-            f"✅ <b>{n}</b> link(s) selected\n"
-            "\n"
-            f"{_div()}\n"
-            "Send the <b>replacement text</b> now.\n"
-            "\n"
-            "• /skip — remove instead\n"
-            "• /cancel — abort\n",
+            sc(_box("✎ replace") + "\n\n"
+               f"▤ <b>{escape(s['file_name'])}</b>\n"
+               f"✓ <b>{n}</b> link(s) selected\n\n" + _div() + "\n"
+               "send the replacement text now.\n\n"
+               "• /skip — remove instead\n"
+               "• /cancel — abort\n"),
             parse_mode="HTML",
         )
 
@@ -654,9 +1123,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer("Cancelled")
         try:
             await q.edit_message_text(
-                "❌ <b>Cancelled.</b>\n"
-                "<i>Send a file anytime to start over.</i>",
+                sc("✕ cancelled.\n") +
+                "<i>send a file anytime to start over.</i>",
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_nav_btn("⌂ home", "start")]]),
             )
         except Exception:
             try:
@@ -742,7 +1213,9 @@ def main() -> None:
     start_health_server()
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
